@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: "3,33 * * * *"      # every 30 min, off the top-of-hour stampede
   workflow_dispatch: {}          # manual kick + auth smoke-test
+  push:                          # a grab attempt whenever the grabber logic changes
+    branches: [master]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/oci-grab.yml'
 concurrency:
   group: oci-grab                # a delayed run can never overlap a running one
   cancel-in-progress: false
