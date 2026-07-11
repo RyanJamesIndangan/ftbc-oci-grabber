@@ -1,0 +1,5 @@
+# These scripts run on Linux runners / cloud-init — force LF so CRLF never breaks bash.
+* text=auto eol=lf
+*.sh   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
