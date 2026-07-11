@@ -1,0 +1,114 @@
+name: oci-grab
+# Laptop-independent Oracle Cloud "Always Free" VM grabber for Faith Temple Baptist.
+# Runs on GitHub-hosted runners every 30 min. Idempotently tries to launch the free
+# ARM A1.Flex (1 OCPU / 6 GB) VM, falling back to the AMD E2.1.Micro, in ap-singapore-1.
+# On a win the VM self-provisions via cloud-init (clones the app + runs its own
+# deploy/server-setup.sh) and pushes a phone notification through ntfy.sh.
+on:
+  schedule:
+    - cron: "3,33 * * * *"      # every 30 min, off the top-of-hour stampede
+  workflow_dispatch: {}          # manual kick + auth smoke-test
+concurrency:
+  group: oci-grab                # a delayed run can never overlap a running one
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      # The OCI CLI authenticates purely from env — the RSA PEM never touches disk.
+      OCI_CLI_USER:        ${{ secrets.OCI_USER_OCID }}
+      OCI_CLI_TENANCY:     ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_KEY_PEM }}
+      OCI_CLI_REGION:      ap-singapore-1
+      OCI_CLI_AUTH:        api_key
+      COMPARTMENT_OCID:    ${{ secrets.OCI_COMPARTMENT_OCID }}
+      SUBNET_OCID:         ${{ secrets.OCI_SUBNET_OCID }}
+      IMAGE_ARM:           ${{ secrets.OCI_IMAGE_ARM }}
+      IMAGE_AMD:           ${{ secrets.OCI_IMAGE_AMD }}
+      DISPLAY_NAME:        ftbc-prod
+      VM_DEPLOY_KEY:       ${{ secrets.VM_DEPLOY_KEY }}
+      NTFY_TOPIC:          ${{ secrets.NTFY_TOPIC }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore OCI CLI cache
+        id: cache-oci
+        uses: actions/cache@v4
+        with:
+          path: ~/.local
+          key: oci-cli-v1
+
+      - name: Install OCI CLI (cache miss only)
+        if: steps.cache-oci.outputs.cache-hit != 'true'
+        run: python3 -m pip install --user --quiet oci-cli
+
+      - name: Add CLI to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Materialise VM login public key
+        run: printf '%s\n' "${{ secrets.VM_SSH_PUBLIC_KEY }}" > vm_login.pub
+
+      - name: Grab (idempotent)
+        id: grab
+        run: bash scripts/grab.sh
+
+      - name: Resolve public IP
+        if: steps.grab.outputs.launched == 'true'
+        id: net
+        run: |
+          OCID='${{ steps.grab.outputs.instance_ocid }}'
+          oci compute instance get --instance-id "$OCID" \
+            --wait-for-state RUNNING --max-wait-seconds 420 >/dev/null
+          IP=$(oci compute instance list-vnics --instance-id "$OCID" \
+            --query 'data[0]."public-ip"' --raw-output)
+          echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "::notice title=OCI VM ACQUIRED::$IP ($OCID) — cloud-init provisioning now."
+
+      - name: Notify — VM acquired
+        if: steps.grab.outputs.launched == 'true'
+        run: |
+          IP='${{ steps.net.outputs.public_ip }}'; OCID='${{ steps.grab.outputs.instance_ocid }}'
+          curl -s -H "Title: OCI VM ACQUIRED (ap-singapore-1)" -H "Priority: urgent" \
+               -H "Tags: tada,rocket" \
+               -d "IP=$IP  OCID=$OCID — cloud-init provisioning FTBC, deploy underway." \
+               "https://ntfy.sh/${NTFY_TOPIC}" || true
+
+      - name: Wait for provisioning + verify live
+        if: steps.grab.outputs.launched == 'true'
+        env:
+          VM_SSH_PRIVATE_KEY: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+        run: |
+          IP='${{ steps.net.outputs.public_ip }}'
+          umask 077; printf '%s\n' "$VM_SSH_PRIVATE_KEY" > id_vm
+          # SSH comes up first; cloud-init status --wait BLOCKS until server-setup.sh finishes.
+          for i in $(seq 1 90); do
+            ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+                -i id_vm ubuntu@"$IP" 'cloud-init status --wait' && break || sleep 10
+          done
+          UP=""
+          for i in $(seq 1 30); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://$IP/)" = "200" ] \
+              && { UP=1; break; } || sleep 10
+          done
+          rm -f id_vm
+          if [ -n "$UP" ]; then
+            echo "::notice title=FTBC LIVE::http://$IP/ returned 200"
+            curl -s -H "Title: FTBC LIVE" -H "Tags: white_check_mark" \
+                 -d "http://$IP/ is up" "https://ntfy.sh/${NTFY_TOPIC}" || true
+          else
+            echo "::warning::VM up but HTTP not 200 yet — check cloud-init on the box."
+            curl -s -H "Title: FTBC VM up, site pending" -H "Tags: hourglass" \
+                 -d "http://$IP/ not 200 yet — cloud-init may still be running." \
+                 "https://ntfy.sh/${NTFY_TOPIC}" || true
+          fi
+
+      - name: Alert on failure
+        if: failure()
+        run: |
+          curl -s -H "Title: OCI grabber ERROR" -H "Priority: high" -H "Tags: warning" \
+               -d "Run ${{ github.run_id }} failed — check the Actions logs." \
+               "https://ntfy.sh/${NTFY_TOPIC}" || true

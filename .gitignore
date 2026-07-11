@@ -1,0 +1,5 @@
+# Runtime artefacts the workflow creates in its checkout — never commit these.
+rendered-cloud-init.yaml
+vm_login.pub
+id_vm
+*.pem

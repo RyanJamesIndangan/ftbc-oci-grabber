@@ -1,0 +1,34 @@
+#cloud-config
+# Self-provisioning for a freshly-grabbed Oracle Always-Free Ubuntu VM.
+# Clones the (private) Faith Temple Baptist repo over SSH using a read-only deploy
+# key, then hands off to the app's own deploy/server-setup.sh (PHP 8.3 + MySQL +
+# Nginx + Composer + Node + queue worker + scheduler + first deploy).
+#
+# Placeholders __DEPLOY_KEY_B64__ and __NTFY_TOPIC__ are substituted by grab.sh at
+# launch time; the rendered file is passed to OCI as instance user-data only and is
+# never committed to this public repo.
+package_update: true
+packages: [git, ca-certificates, curl, openssl]
+
+write_files:
+  - path: /etc/ftbc/deploy_key
+    permissions: '0600'
+    owner: www-data:www-data
+    encoding: b64
+    content: __DEPLOY_KEY_B64__
+
+runcmd:
+  # Pin GitHub's host keys so the www-data clone needs no interactive prompt.
+  - [ bash, -lc, "install -d -m0755 /etc/ftbc; ssh-keyscan -t ed25519,rsa github.com > /etc/ftbc/known_hosts 2>/dev/null; chmod 0644 /etc/ftbc/known_hosts" ]
+  # System-wide git config: every user (root during setup, www-data during deploy)
+  # clones/fetches via the read-only deploy key.
+  - [ bash, -lc, "git config --system core.sshCommand 'ssh -i /etc/ftbc/deploy_key -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/ftbc/known_hosts -o StrictHostKeyChecking=yes'" ]
+  - [ bash, -lc, "git config --system --add safe.directory /var/www/faithtemplebaptist" ]
+  # Clone the app AS www-data (owner == git user, so the deploy key's 0600 perms are valid).
+  - [ bash, -lc, "install -d -m0755 -o www-data -g www-data /var/www; install -d -m0755 -o www-data -g www-data /var/www/faithtemplebaptist; sudo -u www-data git clone -b main git@github.com:RyanJamesIndangan/faithtemplebaptist.git /var/www/faithtemplebaptist" ]
+  # Give the DB user a strong, box-local random password, then run the app's own provisioner.
+  - [ bash, -lc, "cd /var/www/faithtemplebaptist; sed -i \"s/CHANGE_ME_strong_password/$(openssl rand -hex 24)/\" deploy/server-setup.sh; bash deploy/server-setup.sh" ]
+  # Serve on the bare public IP until a domain is wired.
+  - [ bash, -lc, "cd /var/www/faithtemplebaptist; IP=$(curl -s --max-time 5 https://ifconfig.me || true); [ -n \"$IP\" ] && sed -i -E \"s#^APP_URL=.*#APP_URL=http://$IP#\" .env && sudo -u www-data php artisan config:cache || true" ]
+  # Ping the phone: provisioning finished.
+  - [ bash, -lc, "curl -s -H 'Title: FTBC provisioned' -H 'Tags: white_check_mark' -d \"Server up at http://$(curl -s --max-time 5 ifconfig.me)/\" https://ntfy.sh/__NTFY_TOPIC__ || true" ]
