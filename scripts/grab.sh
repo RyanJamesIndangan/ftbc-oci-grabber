@@ -40,16 +40,17 @@ log "ADs: ${ADS[*]}"
 NEW_OCID=""
 launch() {  # $1 shape  $2 image  $3 ad  [extra args…]
   local shape="$1" image="$2" ad="$3"; shift 3
-  local rt out rc
-  # Stable retry token → server-side 24h dedup if a launch succeeds but the reply is lost.
-  rt="ftbc-$(printf '%s' "${shape}-${ad}" | tr -c 'A-Za-z0-9' '-' | cut -c1-56)"
+  local out rc
+  # No duplicate risk: the pre-launch instance-list guard (step 1) + the workflow's
+  # `concurrency` group mean a re-run always reconciles against reality first, so a
+  # second VM can never be created even if a reply is lost mid-launch.
   log "try $shape @ $ad"
   out=$(oci compute instance launch \
         --availability-domain "$ad" --compartment-id "$COMPARTMENT_OCID" \
         --shape "$shape" "$@" --image-id "$image" --subnet-id "$SUBNET_OCID" \
         --assign-public-ip true --ssh-authorized-keys-file vm_login.pub \
         --user-data-file rendered-cloud-init.yaml --display-name "$DN" \
-        --opc-retry-token "$rt" --query 'data.id' --raw-output 2>&1); rc=$?
+        --query 'data.id' --raw-output 2>&1); rc=$?
   if [ $rc -eq 0 ] && [ -n "$out" ] && [[ "$out" == ocid1.instance* ]]; then
     NEW_OCID="$out"; return 0
   fi
